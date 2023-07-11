@@ -1,7 +1,7 @@
 <?php
 /*
  +-------------------------------------------------------------------------+
- | Copyright (C) 2004-2020 The Cacti Group                                 |
+ | Copyright (C) 2004-2023 The Cacti Group                                 |
  |                                                                         |
  | This program is free software; you can redistribute it and/or           |
  | modify it under the terms of the GNU General Public License             |
@@ -22,16 +22,16 @@
  +-------------------------------------------------------------------------+
 */
 
-include_once($config['base_path'] . '/plugins/syslog/database.php');
-
 function plugin_syslog_install() {
 	global $config, $syslog_upgrade;
 	static $bg_inprocess = false;
 
-	if (file_exists(dirname(__FILE__) . '/config.php')) {
-		include(dirname(__FILE__) . '/config.php');
+	syslog_determine_config();
+
+	if (defined('SYSLOG_CONFIG')) {
+		include(SYSLOG_CONFIG);
 	} else {
-		raise_message('syslog_info', __('Please rename your config.php.dist file in the syslog directory, and change setup your database before installing.', 'syslog'), MESSAGE_LEVEL_ERROR);
+		raise_message('syslog_info', __('Please rename either your config.php.dist or config_local.php.dist files in the syslog directory, and change setup your database before installing.', 'syslog'), MESSAGE_LEVEL_ERROR);
 		header('Location:' . $config['url_path'] . 'plugins.php?header=false');
 		exit;
 	}
@@ -39,7 +39,6 @@ function plugin_syslog_install() {
 	syslog_connect();
 
 	$syslog_exists = sizeof(syslog_db_fetch_row('SHOW TABLES FROM `' . $syslogdb_default . "` LIKE 'syslog'"));
-	$db_version    = syslog_get_mysql_version('syslog');
 
 	/* ================= input validation ================= */
 	get_filter_request_var('days');
@@ -56,6 +55,9 @@ function plugin_syslog_install() {
 	api_plugin_register_hook('syslog', 'config_insert',         'syslog_config_insert',        'setup.php');
 	api_plugin_register_hook('syslog', 'utilities_list',        'syslog_utilities_list',       'setup.php');
 	api_plugin_register_hook('syslog', 'utilities_action',      'syslog_utilities_action',     'setup.php');
+
+	/* hook for table replication */
+	api_plugin_register_hook('syslog', 'replicate_out',         'syslog_replicate_out',        'setup.php');
 
 	api_plugin_register_realm('syslog', 'syslog.php', 'Plugin -> Syslog User', 1);
 	api_plugin_register_realm('syslog', 'syslog_alerts.php,syslog_removal.php,syslog_reports.php', 'Plugin -> Syslog Administration', 1);
@@ -77,7 +79,7 @@ function plugin_syslog_install() {
 		header('Location:' . $config['url_path'] . 'plugins.php?mode=uninstall&id=syslog&uninstall&uninstall_method=all');
 		exit;
 	} else {
-		syslog_install_advisor($syslog_exists, $db_version);
+		syslog_install_advisor($syslog_exists);
 		exit;
 	}
 }
@@ -107,12 +109,9 @@ function syslog_execute_update($syslog_exists, $options) {
 }
 
 function plugin_syslog_uninstall() {
-	global $config, $cnn_id, $syslog_incoming_config, $database_default, $database_hostname, $database_username;
+	global $config, $syslogdb_default;
 
-	/* database connection information, must be loaded always */
-	include(dirname(__FILE__) . '/config.php');
-	include_once(dirname(__FILE__) . '/functions.php');
-
+	syslog_determine_config();
 	syslog_connect();
 
 	if (isset_request_var('cancel') || isset_request_var('return')) {
@@ -158,18 +157,44 @@ function plugin_syslog_upgrade() {
 }
 
 function syslog_connect() {
-	global $config, $cnn_id, $syslog_cnn, $database_default;
+	global $config, $syslog_cnn, $syslogdb_default, $local_db_cnn_id, $remote_db_cnn_id;
 
-	include(dirname(__FILE__) . '/config.php');
+	syslog_determine_config();
+
+	// Handle remote syslog processing
+	include(SYSLOG_CONFIG);
 	include_once(dirname(__FILE__) . '/functions.php');
+	include_once(dirname(__FILE__) . '/database.php');
+
+	$connect_remote = false;
+	$connected      = true;
 
 	/* Connect to the Syslog Database */
 	if (empty($syslog_cnn)) {
-		if ((strtolower($database_hostname) == strtolower($syslogdb_hostname)) &&
-			($database_default == $syslogdb_default)) {
-			/* move on, using Cacti */
-			$syslog_cnn = $cnn_id;
+		if ($config['poller_id'] == 1) {
+			if ($use_cacti_db == true) {
+				$syslog_cnn = $local_db_cnn_id;
+				$connected = true;
+			} else {
+				$connect_remote = true;
+			}
+		} elseif (isset($config['syslog_remote_db'])) {
+			if ($use_cacti_db == true) {
+				$syslog_cnn = $local_db_cnn_id;
+				$connected = true;
+			} else {
+				$connect_remote = true;
+			}
 		} else {
+			if ($use_cacti_db == true) {
+				$syslog_cnn = $remote_db_cnn_id;
+				$connected = true;
+			} else {
+				$connect_remote = true;
+			}
+		}
+
+		if ($connect_remote) {
 			if (!isset($syslogdb_port)) {
 				$syslogdb_port = '3306';
 			}
@@ -195,19 +220,31 @@ function syslog_connect() {
 			}
 
 			$syslog_cnn = syslog_db_connect_real($syslogdb_hostname, $syslogdb_username, $syslogdb_password, $syslogdb_default, $syslogdb_type, $syslogdb_port, $syslogdb_retries, $syslogdb_ssl, $syslogdb_ssl_key, $syslogdb_ssl_cert, $syslogdb_ssl_ca);
+
 			if ($syslog_cnn == false) {
-					print "Can not connect\n";
-					return FALSE;
+				print "FATAL Can not connect\n";
+				$connected = false;
 			}
 		}
+
+		if ($connected && !syslog_db_table_exists('syslog') && api_plugin_is_enabled('syslog')) {
+			cacti_log('Setting Up Database Tables Since they do not exist', false, 'SYSLOG');
+
+			if (!isset($syslog_install_options)) {
+				$syslog_install_options = array();
+			}
+
+			syslog_setup_table_new($syslog_install_options);
+		}
 	}
+
+	return $connected;
 }
 
 function syslog_check_upgrade() {
-	global $config, $syslog_cnn, $cnn_id, $syslog_levels, $database_default, $syslog_upgrade;
+	global $config, $syslogdb_default, $syslog_levels, $syslog_upgrade;
 
-	include(dirname(__FILE__) . '/config.php');
-
+	syslog_determine_config();
 	syslog_connect();
 
 	// Let's only run this check if we are on a page that actually needs the data
@@ -243,6 +280,8 @@ function syslog_check_upgrade() {
 				ADD PRIMARY KEY(id),
 				ADD UNIQUE INDEX (`host_id`,`facility_id`,`priority_id`,`program_id`,`insert_time`)');
 		}
+
+		api_plugin_register_hook('syslog', 'replicate_out', 'syslog_replicate_out', 'setup.php', 1);
 
 		db_execute("UPDATE plugin_config SET version='$current' WHERE directory='syslog'");
 		db_execute("UPDATE plugin_config SET
@@ -325,28 +364,59 @@ function syslog_check_upgrade() {
 					array($hash, $r['id']));
 			}
 		}
+
+		if (!syslog_db_column_exists('syslog_alert', 'level')) {
+			syslog_db_add_column('syslog_alert', array(
+				'name'     => 'level',
+				'type'     => 'int(10)',
+				'unsigned' => true,
+				'NULL'     => false,
+				'default'  => '0',
+				'after'    => 'method')
+			);
+		}
+
+		if (!syslog_db_column_exists('syslog_alert', 'notify')) {
+			syslog_db_add_column('syslog_alert', array(
+				'name'     => 'notify',
+				'type'     => 'int(10)',
+				'unsigned' => true,
+				'NULL'     => false,
+				'default'  => '0',
+				'after'    => 'email')
+			);
+		}
+
+		if (!syslog_db_column_exists('syslog_alert', 'body')) {
+			syslog_db_add_column('syslog_alert', array(
+				'name'     => 'body',
+				'type'     => 'varchar(8192)',
+				'NULL'     => false,
+				'default'  => '',
+				'after'    => 'message')
+			);
+		}
+
+		if (!syslog_db_column_exists('syslog_reports', 'notify')) {
+			syslog_db_add_column('syslog_reports', array(
+				'name'     => 'notify',
+				'type'     => 'int(10)',
+				'unsigned' => true,
+				'NULL'     => false,
+				'default'  => '0',
+				'after'    => 'email')
+			);
+		}
+
+		syslog_db_execute('ALTER TABLE syslog_reports MODIFY column body VARCHAR(8192) NOT NULL default ""');
 	}
-}
-
-function syslog_get_mysql_version($db = 'cacti') {
-	if ($db == 'cacti') {
-		$dbInfo = db_fetch_row("SHOW GLOBAL VARIABLES LIKE 'version'");
-	} else {
-		$dbInfo = syslog_db_fetch_row("SHOW GLOBAL VARIABLES LIKE 'version'");
-
-	}
-
-	if (cacti_sizeof($dbInfo)) {
-		return floatval($dbInfo['Value']);
-	}
-
-	return '';
 }
 
 function syslog_create_partitioned_syslog_table($engine = 'InnoDB', $days = 30) {
-	global $config, $mysqlVersion, $cnn_id, $syslog_incoming_config, $syslog_levels, $database_default, $database_hostname, $database_username;
+	global $config, $syslogdb_default, $syslog_levels;
 
-	include(dirname(__FILE__) . '/config.php');
+	syslog_determine_config();
+	syslog_connect();
 
 	$sql = "CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog` (
 		facility_id int(10) unsigned default NULL,
@@ -354,7 +424,7 @@ function syslog_create_partitioned_syslog_table($engine = 'InnoDB', $days = 30) 
 		program_id int(10) unsigned default NULL,
 		host_id int(10) unsigned default NULL,
 		logtime DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00',
-		message " . ($mysqlVersion > 5 ? "varchar(1024)":"text") . " NOT NULL default '',
+		message varchar(1024) NOT NULL default '',
 		seq bigint unsigned NOT NULL auto_increment,
 		PRIMARY KEY(seq, logtime),
 		INDEX `seq` (`seq`),
@@ -362,7 +432,8 @@ function syslog_create_partitioned_syslog_table($engine = 'InnoDB', $days = 30) 
 		INDEX program_id (program_id),
 		INDEX host_id (host_id),
 		INDEX priority_id (priority_id),
-		INDEX facility_id (facility_id)) ENGINE=$engine
+		INDEX facility_id (facility_id))
+		ENGINE=$engine
 		PARTITION BY RANGE (TO_DAYS(logtime))\n";
 
 	$now = time();
@@ -380,9 +451,10 @@ function syslog_create_partitioned_syslog_table($engine = 'InnoDB', $days = 30) 
 }
 
 function syslog_setup_table_new($options) {
-	global $config, $cnn_id, $settings, $mysqlVersion, $syslog_incoming_config, $syslog_levels, $database_default, $database_hostname, $database_username;
+	global $config, $settings, $syslogdb_default, $syslog_levels;
 
-	include(dirname(__FILE__) . '/config.php');
+	syslog_determine_config();
+	syslog_connect();
 
 	$tables  = array();
 
@@ -398,14 +470,41 @@ function syslog_setup_table_new($options) {
 		8 => 'other'
 	);
 
-	syslog_connect();
+	// Set default if they are not set.
+	if (!cacti_sizeof($options)) {
+		$options['upgrade_type'] = read_config_option('syslog_install_upgrade_type');
+		$options['engine']       = read_config_option('syslog_install_engine');
+		$options['db_type']      = read_config_option('syslog_install_db_type');
+		$options['days']         = read_config_option('syslog_install_days');
+
+		if (empty($options['upgrade_type'])) {
+			$options['upgrade_type'] = 'upgrade';
+		}
+
+		if (empty($options['engine'])) {
+			$options['engine'] = 'InnoDB';
+		}
+
+		if (empty($options['db_type'])) {
+			$options['db_type'] = 'part';
+		}
+
+		if (empty($options['days'])) {
+			$options['days'] = 30;
+		}
+	}
 
 	/* validate some simple information */
-	$mysqlVersion = syslog_get_mysql_version('syslog');
 	$truncate     = isset($options['upgrade_type']) && $options['upgrade_type'] == 'truncate' ? true:false;
 	$engine       = isset($options['engine']) && $options['engine'] == 'innodb' ? 'InnoDB':'MyISAM';
 	$partitioned  = isset($options['db_type']) && $options['db_type'] == 'part' ? true:false;
 	$syslogexists = sizeof(syslog_db_fetch_row("SHOW TABLES FROM `" . $syslogdb_default . "` LIKE 'syslog'"));
+
+	/* set table construction settings for the remote pollers */
+	set_config_option('syslog_install_upgrade_type', empty($options['upgrade_type'])?'':$options['upgrade_type'], true);
+	set_config_option('syslog_install_engine',       empty($options['engine'])      ?'':$options['engine'], true);
+	set_config_option('syslog_install_db_type',      empty($options['db_type'])     ?'':$options['db_type'], true);
+	set_config_option('syslog_install_days',         empty($options['days'])        ?'':$options['days'], true);
 
 	if ($truncate) {
 		syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog`");
@@ -426,7 +525,8 @@ function syslog_setup_table_new($options) {
 			INDEX program_id (program_id),
 			INDEX host_id (host_id),
 			INDEX priority_id (priority_id),
-			INDEX facility_id (facility_id)) ENGINE=$engine;");
+			INDEX facility_id (facility_id))
+			ENGINE=$engine;");
 	} else {
 		syslog_create_partitioned_syslog_table($engine, $options['days']);
 	}
@@ -441,20 +541,27 @@ function syslog_setup_table_new($options) {
 		`name` varchar(255) NOT NULL default '',
 		`severity` int(10) UNSIGNED NOT NULL default '0',
 		`method` int(10) unsigned NOT NULL default '0',
+		`level` int(10) unsigned NOT NULL default '0',
 		`num` int(10) unsigned NOT NULL default '1',
 		`type` varchar(16) NOT NULL default '',
 		`enabled` CHAR(2) default 'on',
 		`repeat_alert` int(10) unsigned NOT NULL default '0',
 		`open_ticket` CHAR(2) default '',
 		`message` VARCHAR(2048) NOT NULL default '',
+		`body` VARCHAR(8192) NOT NULL default '',
 		`user` varchar(32) NOT NULL default '',
 		`date` int(16) NOT NULL default '0',
 		`email` varchar(255) default NULL,
+		`notify` int(10) unsigned NOT NULL default '0',
 		`command` varchar(255) default NULL,
 		`notes` varchar(255) default NULL,
-		PRIMARY KEY (id)) ENGINE=$engine;");
+		PRIMARY KEY (id))
+		ENGINE=$engine;");
 
-	if ($truncate) syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_incoming`");
+	if ($truncate) {
+		syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_incoming`");
+	}
+
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog_incoming` (
 		facility_id int(10) unsigned default NULL,
 		priority_id int(10) unsigned default NULL,
@@ -466,9 +573,13 @@ function syslog_setup_table_new($options) {
 		`status` tinyint(4) NOT NULL default '0',
 		PRIMARY KEY (seq),
 		INDEX program (program),
-		INDEX `status` (`status`)) ENGINE=$engine;");
+		INDEX `status` (`status`))
+		ENGINE=$engine;");
 
-	if ($truncate) syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_remove`");
+	if ($truncate) {
+		syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_remove`");
+	}
+
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog_remove` (
 		id int(10) NOT NULL auto_increment,
 		`hash` varchar(32) NOT NULL default '',
@@ -480,7 +591,8 @@ function syslog_setup_table_new($options) {
 		`user` varchar(32) NOT NULL default '',
 		`date` int(16) NOT NULL default '0',
 		notes varchar(255) default NULL,
-		PRIMARY KEY (id)) ENGINE=$engine;");
+		PRIMARY KEY (id))
+		ENGINE=$engine;");
 
 	$present = syslog_db_fetch_row("SHOW TABLES FROM `" . $syslogdb_default . "` LIKE 'syslog_reports'");
 
@@ -490,7 +602,10 @@ function syslog_setup_table_new($options) {
 		$newreport = true;
 	}
 
-	if ($truncate || !$newreport) syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_reports`");
+	if ($truncate || !$newreport) {
+		syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_reports`");
+	}
+
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog_reports` (
 		id int(10) NOT NULL auto_increment,
 		`hash` varchar(32) NOT NULL default '',
@@ -500,22 +615,28 @@ function syslog_setup_table_new($options) {
 		timespan int(16) NOT NULL default '0',
 		timepart char(5) NOT NULL default '00:00',
 		lastsent int(16) NOT NULL default '0',
-		body " . ($mysqlVersion > 5 ? "varchar(1024)":"text") . " default NULL,
+		body varchar(8192) NOT NULL default '0',
 		message varchar(2048) default NULL,
 		`user` varchar(32) NOT NULL default '',
 		`date` int(16) NOT NULL default '0',
 		email varchar(255) default NULL,
+		notify int(10) unsigned NOT NULL default '0',
 		notes varchar(255) default NULL,
-		PRIMARY KEY (id)) ENGINE=$engine;");
+		PRIMARY KEY (id))
+		ENGINE=$engine;");
 
-	if ($truncate) syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_hosts`");
+	if ($truncate) {
+		syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_hosts`");
+	}
+
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog_programs` (
 		`program_id` int(10) unsigned NOT NULL auto_increment,
 		`program` VARCHAR(40) NOT NULL,
 		`last_updated` TIMESTAMP NOT NULL default CURRENT_TIMESTAMP on update CURRENT_TIMESTAMP,
 		PRIMARY KEY (`program`),
 		INDEX host_id (`program_id`),
-		INDEX last_updated (`last_updated`)) ENGINE=$engine
+		INDEX last_updated (`last_updated`))
+		ENGINE=$engine
 		COMMENT='Contains all programs currently in the syslog table'");
 
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog_hosts` (
@@ -524,16 +645,19 @@ function syslog_setup_table_new($options) {
 		`last_updated` TIMESTAMP NOT NULL default CURRENT_TIMESTAMP on update CURRENT_TIMESTAMP,
 		PRIMARY KEY (`host`),
 		INDEX host_id (`host_id`),
-		INDEX last_updated (`last_updated`)) ENGINE=$engine
+		INDEX last_updated (`last_updated`))
+		ENGINE=$engine
 		COMMENT='Contains all hosts currently in the syslog table'");
 
 	syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_facilities`");
+
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `". $syslogdb_default . "`.`syslog_facilities` (
 		`facility_id` int(10) unsigned NOT NULL,
 		`facility` varchar(10) NOT NULL,
 		`last_updated` TIMESTAMP NOT NULL default CURRENT_TIMESTAMP on update CURRENT_TIMESTAMP,
 		PRIMARY KEY  (`facility_id`),
-		INDEX last_updated (`last_updated`)) ENGINE=$engine;");
+		INDEX last_updated (`last_updated`))
+		ENGINE=$engine;");
 
 	syslog_db_execute("INSERT INTO `" .  $syslogdb_default . "`.`syslog_facilities` (facility_id, facility) VALUES
 		(0,'kern'), (1,'user'), (2,'mail'), (3,'daemon'), (4,'auth'), (5,'syslog'), (6,'lpd'), (7,'news'),
@@ -542,6 +666,7 @@ function syslog_setup_table_new($options) {
 		(22,'local6'), (23,'local7');");
 
 	syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_priorities`");
+
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `". $syslogdb_default . "`.`syslog_priorities` (
 		`priority_id` int(10) unsigned NOT NULL,
 		`priority` varchar(10) NOT NULL,
@@ -560,7 +685,10 @@ function syslog_setup_table_new($options) {
 		PRIMARY KEY  (`host_id`,`facility_id`))
 		ENGINE=$engine;");
 
-	if ($truncate) syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_removed`");
+	if ($truncate) {
+		syslog_db_execute("DROP TABLE IF EXISTS `" . $syslogdb_default . "`.`syslog_removed`");
+	}
+
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog_removed` LIKE `" . $syslogdb_default . "`.`syslog`");
 
 	syslog_db_execute("CREATE TABLE IF NOT EXISTS `" . $syslogdb_default . "`.`syslog_logs` (
@@ -609,12 +737,97 @@ function syslog_setup_table_new($options) {
 
 	foreach($settings['syslog'] AS $name => $values) {
 		if (isset($values['default'])) {
-			db_execute('REPLACE INTO `' . $database_default . "`.`settings` (name, value) VALUES ('$name', '" . $values['default'] . "')");
+			set_config_option($name, $values['default']);
 		}
 	}
 }
 
-function plugin_syslog_version () {
+function syslog_replicate_out($data) {
+	syslog_determine_config();
+	syslog_connect();
+
+	if (read_config_option('syslog_remote_enabled') == 'on' && read_config_option('syslog_remote_sync_rules') == 'on') {
+		$remote_poller_id = $data['remote_poller_id'];
+		$rcnn_id          = $data['rcnn_id'];
+		$class            = $data['class'];
+
+		cacti_log('INFO: Replacting for the Syslog Plugin', false, 'REPLICATE');
+
+		if ($class == 'all') {
+			$tdata = syslog_db_fetch_assoc('SELECT * FROM syslog_alert');
+			replicate_out_table($rcnn_id, $tdata, 'syslog_alert', $remote_poller_id);
+			$tdata = syslog_db_fetch_assoc('SELECT * FROM syslog_remove');
+			replicate_out_table($rcnn_id, $tdata, 'syslog_remove', $remote_poller_id);
+			$tdata = syslog_db_fetch_assoc('SELECT * FROM syslog_reports');
+			replicate_out_table($rcnn_id, $tdata, 'syslog_reports', $remote_poller_id);
+		}
+	}
+
+	return $data;
+}
+
+function syslog_replicate_in() {
+	syslog_determine_config();
+	syslog_connect();
+
+	if (read_config_option('syslog_remote_enabled') == 'on' && read_config_option('syslog_remote_sync_rules') == 'on') {
+		$data = db_fetch_assoc('SELECT * FROM syslog_alert');
+		syslog_replace_data('syslog_alert', $data);
+
+		$data = db_fetch_assoc('SELECT * FROM syslog_remove');
+		syslog_replace_data('syslog_remove', $data);
+
+		$data = db_fetch_assoc('SELECT * FROM syslog_reports');
+		syslog_replace_data('syslog_reports', $data);
+	}
+}
+
+function syslog_replace_data($table, &$data) {
+	if (cacti_sizeof($data)) {
+		$sqlData  = array();
+		$sqlQuery = array();
+		$columns  = array_keys($data[0]);
+
+		$create = db_fetch_row('SHOW CREATE TABLE ' . $table);
+		if (isset($create["CREATE TABLE `$table`"]) || isset($create['Create Table'])) {
+			if (isset($create["CREATE TABLE `$table`"])) {
+				$create_sql = $create["CREATE TABLE `$table`"];
+			} else {
+				$create_sql = $create['Create Table'];
+			}
+		}
+
+		if (!syslog_db_table_exists($table)) {
+			syslog_db_execute($create);
+			syslog_db_execute("TRUNCATE TABLE $table");
+		}
+
+		// Make the prefix
+		$sql_prefix = "INSERT INTO $table (`" . implode('`,`', $columns) . '`) VALUES ';
+
+		// Make the suffix
+		$sql_suffix = ' ON DUPLICATE KEY UPDATE ';
+		foreach($columns as $c) {
+			$sql_suffix .= " $c = VALUES($c),";
+		}
+		$sql_suffix = trim($sql_suffix, ',');
+
+		// Construct the prepared statement
+		foreach($data as $row) {
+			$sqlQuery[] = '(' . trim(str_repeat('?, ', cacti_sizeof($columns)), ', ') . ')';
+
+			foreach($row as $col) {
+				$sqlData[] = $col;
+			}
+		}
+
+		$sql = implode(', ', $sqlQuery);
+
+		syslog_db_execute_prepared($sql_prefix . $sql . $sql_suffix, $sqlData);
+	}
+}
+
+function plugin_syslog_version() {
 	global $config;
 	$info = parse_ini_file($config['base_path'] . '/plugins/syslog/INFO', true);
 	return $info['info'];
@@ -627,12 +840,16 @@ function syslog_check_dependencies() {
 function syslog_poller_bottom() {
 	global $config;
 
-	$command_string = read_config_option('path_php_binary');
-	$extra_args = ' -q ' . $config['base_path'] . '/plugins/syslog/syslog_process.php';
-	exec_background($command_string, $extra_args);
+	if (syslog_config_safe()) {
+		$command_string = read_config_option('path_php_binary');
+		$extra_args = ' -q ' . $config['base_path'] . '/plugins/syslog/syslog_process.php';
+		exec_background($command_string, $extra_args);
+	} else {
+		cacti_log('WARNING: You have installed the Syslog plugin, but you have not properly set a config.php or config_local.php', false, 'POLLER');
+	}
 }
 
-function syslog_install_advisor($syslog_exists, $db_version) {
+function syslog_install_advisor($syslog_exists) {
 	global $config, $syslog_retentions;
 
 	top_header();
@@ -654,7 +871,7 @@ function syslog_install_advisor($syslog_exists, $db_version) {
 		'engine' => array(
 			'method' => 'drop_array',
 			'friendly_name' => __('Database Storage Engine', 'syslog'),
-			'description' => __('In MySQL 5.1.6 and above, you have the option to make this a partitioned table by days.  Prior to this release, you only have the traditional table structure available.', 'syslog'),
+			'description' => __('You have the option to make this a partitioned table by days.', 'syslog'),
 			'value' => 'innodb',
 			'array' => array(
 				'myisam' => __('MyISAM Storage', 'syslog'),
@@ -664,16 +881,12 @@ function syslog_install_advisor($syslog_exists, $db_version) {
 		'db_type' => array(
 			'method' => 'drop_array',
 			'friendly_name' => __('Database Architecture', 'syslog'),
-			'description' => __('In MySQL 5.1.6 and above, you have the option to make this a partitioned table by days.  In MySQL 5.5 and above, you can create multiple partitions per day.  Prior to MySQL 5.1.6, you only have the traditional table structure available.', 'syslog'),
-			'value' => 'trad',
-			'array' => ($db_version >= '5.1' ?
-				array(
+			'description' => __('You have the option to make this a partitioned table by days.  You can create multiple partitions per day.', 'syslog'),
+			'value' => 'part',
+			'array' => array(
 				'trad' => __('Traditional Table', 'syslog'),
-				'part' => __('Partitioned Table', 'syslog')) :
-				array(
-					'trad' => __('Traditional Table', 'syslog')
-				)
-			),
+				'part' => __('Partitioned Table', 'syslog')
+			)
 		),
 		'days' => array(
 			'method' => 'drop_array',
@@ -696,21 +909,19 @@ function syslog_install_advisor($syslog_exists, $db_version) {
 		)
 	);
 
-	if ($db_version >= 5.5) {
-		$fields_syslog_update['dayparts'] = array(
-			'method' => 'drop_array',
-			'friendly_name' => __('Partitions per Day', 'syslog'),
-			'description' => __('Select the number of partitions per day that you wish to create.', 'syslog'),
-			'value' => '1',
-			'array' => array(
-				'1'  => __('%d Per Day', 1, 'syslog'),
-				'2'  => __('%d Per Day', 2, 'syslog'),
-				'4'  => __('%d Per Day', 4, 'syslog'),
-				'6'  => __('%d Per Day', 6, 'syslog'),
-				'12' => __('%d Per Day', 12, 'syslog')
-			)
-		);
-	}
+	$fields_syslog_update['dayparts'] = array(
+		'method' => 'drop_array',
+		'friendly_name' => __('Partitions per Day', 'syslog'),
+		'description' => __('Select the number of partitions per day that you wish to create.', 'syslog'),
+		'value' => '1',
+		'array' => array(
+			'1'  => __('%d Per Day', 1, 'syslog'),
+			'2'  => __('%d Per Day', 2, 'syslog'),
+			'4'  => __('%d Per Day', 4, 'syslog'),
+			'6'  => __('%d Per Day', 6, 'syslog'),
+			'12' => __('%d Per Day', 12, 'syslog')
+		)
+	);
 
 	if ($syslog_exists) {
 		$type = __('Upgrade', 'syslog');
@@ -727,7 +938,7 @@ function syslog_install_advisor($syslog_exists, $db_version) {
 		print "<p>" . __('The upgrade of the \'main\' syslog table can be a very time consuming process.  As such, it is recommended that you either reduce the size of your syslog table prior to upgrading, or choose the background option</p> <p>If you choose the background option, your legacy syslog table will be renamed, and a new syslog table will be created.  Then, an upgrade process will be launched in the background.  Again, this background process can quite a bit of time to complete.  However, your data will be preserved</p> <p>Regardless of your choice, all existing removal and alert rules will be maintained during the upgrade process.</p> <p>Press <b>\'Upgrade\'</b> to proceed with the upgrade, or <b>\'Cancel\'</b> to return to the Plugins menu.', 'syslog') . "</p></td></tr>";
 	} else {
 		unset($fields_syslog_update['upgrade_type']);
-		print "<p>" . __('You have several options to choose from when installing Syslog.  The first is the Database Architecture.  Starting with MySQL 5.1.6, you can elect to utilize Table Partitioning to prevent the size of the tables from becoming excessive thus slowing queries.', 'syslog') . '</p><p>' . __('You can also set the MySQL storage engine.  If you have not tuned you system for InnoDB storage properties, it is strongly recommended that you utilize the MyISAM storage engine.', 'syslog') . '</p><p>' . __('You can also select the retention duration.  Please keep in mind that if you have several hosts logging to syslog, this table can become quite large.  So, if not using partitioning, you might want to keep the size smaller.', 'syslog') . "</p></td></tr>";
+		print "<p>" . __('You have several options to choose from when installing Syslog.  The first is the Database Architecture.  You should elect to utilize Table Partitioning to prevent the size of the tables from becoming excessive thus slowing queries.', 'syslog') . '</p><p>' . __('You can also set the MySQL storage engine.  If you have not tuned you system for InnoDB storage properties, it is strongly recommended that you utilize the MyISAM storage engine.', 'syslog') . '</p><p>' . __('You can also select the retention duration.  Please keep in mind that if you have several hosts logging to syslog, this table can become quite large.  So, if not using partitioning, you might want to keep the size smaller.', 'syslog') . "</p></td></tr>";
 	}
 	html_end_box();
 	print "<form action='plugins.php' method='get'>\n";
@@ -745,10 +956,10 @@ function syslog_install_advisor($syslog_exists, $db_version) {
 }
 
 function syslog_uninstall_advisor() {
-	global $config;
+	global $config, $syslogdb_default;
 
-	include(dirname(__FILE__) . '/config.php');
-
+	syslog_determine_config();
+	include(SYSLOG_CONFIG);
 	syslog_connect();
 
 	$syslog_exists = sizeof(syslog_db_fetch_row('SHOW TABLES FROM `' . $syslogdb_default . "` LIKE 'syslog'"));
@@ -782,13 +993,16 @@ function syslog_uninstall_advisor() {
 	print "<table align='center' width='80%'><tr><td>\n";
 
 	html_start_box(__('Syslog Uninstall Preferences', 'syslog'), '100%', '', '3', 'center', '');
+
 	draw_edit_form(array(
 		'config' => array(),
 		'fields' => inject_form_variables($fields_syslog_update, array()))
-		);
+	);
+
 	html_end_box();
 
 	syslog_confirm_button('uninstall', 'plugins.php', $syslog_exists);
+
 	print "</td></tr></table>\n";
 
 	bottom_footer();
@@ -826,7 +1040,7 @@ function syslog_confirm_button($action, $cancel_url, $syslog_exists) {
 						});
 					});
 
-					$('#cancel').click(function() {
+					$('#cancel, #return').click(function() {
 						loadPageNoHeader('plugins.php?header=false');
 					});
 				});
@@ -839,7 +1053,15 @@ function syslog_confirm_button($action, $cancel_url, $syslog_exists) {
 }
 
 function syslog_config_settings() {
-	global $tabs, $settings, $syslog_retentions, $syslog_alert_retentions, $syslog_refresh;
+	global $config, $tabs, $formats, $settings, $syslog_retentions, $syslog_alert_retentions, $syslog_refresh;
+
+	include_once($config['base_path'] . '/lib/reports.php');
+
+	if (get_nfilter_request_var('tab') == 'syslog') {
+		$formats = reports_get_format_files();
+	} elseif (empty($formats)) {
+		$formats = array();
+	}
 
 	$tabs['syslog'] = __('Syslog', 'syslog');
 
@@ -851,12 +1073,6 @@ function syslog_config_settings() {
 		'syslog_enabled' => array(
 			'friendly_name' => __('Syslog Enabled', 'syslog'),
 			'description' => __('If this checkbox is set, records will be transferred from the Syslog Incoming table to the main syslog table and Alerts and Reports will be enabled.  Please keep in mind that if the system is disabled log entries will still accumulate into the Syslog Incoming table as this is defined by the rsyslog or syslog-ng process.', 'syslog'),
-			'method' => 'checkbox',
-			'default' => 'on'
-		),
-		'syslog_html' => array(
-			'friendly_name' => __('HTML Based Email', 'syslog'),
-			'description' => __('If this checkbox is set, all Emails will be sent in HTML format.  Otherwise, Emails will be sent in plain text.', 'syslog'),
 			'method' => 'checkbox',
 			'default' => 'on'
 		),
@@ -901,6 +1117,36 @@ function syslog_config_settings() {
 				400 => __('%d Records', 400, 'syslog')
 			)
 		),
+		'syslog_ticket_command' => array(
+			'friendly_name' => __('Command for Opening Tickets', 'syslog'),
+			'description' => __('This command will be executed for opening Help Desk Tickets.  The command will be required to parse multiple input parameters as follows: <b>--alert-name</b>, <b>--severity</b>, <b>--hostlist</b>, <b>--message</b>.  The hostlist will be a comma delimited list of hosts impacted by the alert.', 'syslog'),
+			'method' => 'textbox',
+			'max_length' => 255,
+			'size' => 80
+		),
+		'syslog_html_header' => array(
+			'friendly_name' => __('HTML Notification Settings', 'syslog'),
+			'method' => 'spacer',
+			'collapsible' => 'true'
+		),
+		'syslog_html' => array(
+			'friendly_name' => __('Enable HTML Based Email', 'syslog'),
+			'description' => __('If this checkbox is set, all Emails will be sent in HTML format.  Otherwise, Emails will be sent in plain text.', 'syslog'),
+			'method' => 'checkbox',
+			'default' => 'on'
+		),
+		'syslog_format_file' => array(
+			'friendly_name' => __('Format File to Use', 'syslog'),
+			'method' => 'drop_array',
+			'default' => 'default.format',
+			'description' => __('Choose the custom html wrapper and CSS file to use.  This file contains both html and CSS to wrap around your report.  If it contains more than simply CSS, you need to place a special <REPORT> tag inside of the file.  This format tag will be replaced by the report content.  These files are located in the \'formats\' directory.', 'syslog'),
+			'array' => $formats
+		),
+		'syslog_retention_header' => array(
+			'friendly_name' => __('Data Retention Settings', 'syslog'),
+			'method' => 'spacer',
+			'collapsible' => 'true'
+		),
 		'syslog_retention' => array(
 			'friendly_name' => __('Syslog Retention', 'syslog'),
 			'description' => __('This is the number of days to keep events.', 'syslog'),
@@ -915,13 +1161,22 @@ function syslog_config_settings() {
 			'default' => '30',
 			'array' => $syslog_alert_retentions
 		),
-		'syslog_ticket_command' => array(
-			'friendly_name' => __('Command for Opening Tickets', 'syslog'),
-			'description' => __('This command will be executed for opening Help Desk Tickets.  The command will be required to parse multiple input parameters as follows: <b>--alert-name</b>, <b>--severity</b>, <b>--hostlist</b>, <b>--message</b>.  The hostlist will be a comma delimited list of hosts impacted by the alert.', 'syslog'),
-			'method' => 'textbox',
-			'max_length' => 255,
-			'size' => 80
-		)
+		'syslog_remote_header' => array(
+			'friendly_name' => __('Remote Message Processing', 'syslog'),
+			'method' => 'spacer',
+		),
+		'syslog_remote_enabled' => array(
+			'friendly_name' => __('Enable Remote Data Collector Message Processing', 'syslog'),
+			'description' => __('If your Remote Data Collectors have their own Syslog databases and process their messages independently, check this checkbox.  By checking this Checkbox, your Remote Data Collectors will need to maintain their own \'config_local.php\' file in order to inform Syslog to use an independent database for message display and processing.  Please use the template file \'config_local.php.dist\' for this purpose.  WARNING: Syslog tables will be automatically created as soon as this option is enabled.', 'syslog'),
+			'method' => 'checkbox',
+			'default' => ''
+		),
+		'syslog_remote_sync_rules' => array(
+			'friendly_name' => __('Remote Data Collector Rules Sync', 'syslog'),
+			'description' => __('If your Remote Data Collectors have their own Syslog databases and process thrie messages independently, check this checkbox if you wish the Main Cacti databases Alerts, Removal and Report rules to be sent to the Remote Cacti System.', 'syslog'),
+			'method' => 'checkbox',
+			'default' => ''
+		),
 	);
 
 	if (isset($settings['syslog'])) {
@@ -938,6 +1193,10 @@ function syslog_top_graph_refresh($refresh) {
 function syslog_show_tab() {
 	global $config;
 
+	if (!syslog_config_safe()) {
+		return;
+	}
+
 	if (api_user_realm_auth('syslog.php')) {
 		if (substr_count($_SERVER['REQUEST_URI'], 'syslog.php')) {
 			print '<a href="' . $config['url_path'] . 'plugins/syslog/syslog.php"><img src="' . $config['url_path'] . 'plugins/syslog/images/tab_syslog_down.gif" alt="' . __('Syslog', 'syslog') . '"></a>';
@@ -947,10 +1206,44 @@ function syslog_show_tab() {
 	}
 }
 
+function syslog_determine_config() {
+	global $config;
+
+	// Setup the syslog database settings path
+	if (!defined('SYSLOG_CONFIG')) {
+		if (file_exists(dirname(__FILE__) . '/config_local.php')) {
+			define('SYSLOG_CONFIG', dirname(__FILE__) . '/config_local.php');
+			$config['syslog_remote_db'] = true;
+		} elseif (file_exists(dirname(__FILE__) . '/config.php')) {
+			define('SYSLOG_CONFIG', dirname(__FILE__) . '/config.php');
+			$config['syslog_remote_db'] = false;
+		}
+	}
+}
+
+function syslog_config_safe() {
+	global $config;
+
+	$files = array(
+		dirname(__FILE__) . '/config_local.php',
+		dirname(__FILE__) . '/config.php'
+	);
+
+	foreach($files as $file) {
+		if (file_exists($file) && is_readable($file)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 function syslog_config_arrays () {
-	global $syslog_actions, $menu, $message_types, $severities, $messages;
+	global $syslog_actions, $config, $menu, $message_types, $severities, $messages;
 	global $syslog_levels, $syslog_facilities, $syslog_freqs, $syslog_times, $syslog_refresh;
 	global $syslog_retentions, $syslog_alert_retentions, $menu_glyphs;
+
+	syslog_determine_config();
 
 	$syslog_actions = array(
 		1 => __('Delete', 'syslog'),
@@ -1082,18 +1375,20 @@ function syslog_config_arrays () {
 		$syslog_times[$i] = $hour . ':' . $minute;
 	}
 
-	$menu2 = array ();
-	foreach ($menu as $temp => $temp2 ) {
-		$menu2[$temp] = $temp2;
-		if ($temp == __('Import/Export')) {
-			$menu2[__('Syslog Settings', 'syslog')]['plugins/syslog/syslog_alerts.php']  = __('Alert Rules', 'syslog');
-			$menu2[__('Syslog Settings', 'syslog')]['plugins/syslog/syslog_removal.php'] = __('Removal Rules', 'syslog');
-			$menu2[__('Syslog Settings', 'syslog')]['plugins/syslog/syslog_reports.php'] = __('Report Rules', 'syslog');
+	if (syslog_config_safe()) {
+		$menu2 = array ();
+		foreach ($menu as $temp => $temp2 ) {
+			$menu2[$temp] = $temp2;
+			if ($temp == __('Import/Export')) {
+				$menu2[__('Syslog Settings', 'syslog')]['plugins/syslog/syslog_alerts.php']  = __('Alert Rules', 'syslog');
+				$menu2[__('Syslog Settings', 'syslog')]['plugins/syslog/syslog_removal.php'] = __('Removal Rules', 'syslog');
+				$menu2[__('Syslog Settings', 'syslog')]['plugins/syslog/syslog_reports.php'] = __('Report Rules', 'syslog');
+			}
 		}
-	}
-	$menu = $menu2;
+		$menu = $menu2;
 
-	$menu_glyphs[__('Syslog Settings', 'syslog')] = 'fa fa-life-ring';
+		$menu_glyphs[__('Syslog Settings', 'syslog')] = 'fa fa-life-ring';
+	}
 
 	if (function_exists('auth_augment_roles')) {
 		auth_augment_roles(__('Normal User'), array('syslog.php'));
@@ -1132,6 +1427,12 @@ function syslog_draw_navigation_text ($nav) {
 }
 
 function syslog_config_insert() {
+	if (!syslog_config_safe()) {
+		return;
+	}
+
+	syslog_determine_config();
+	include(SYSLOG_CONFIG);
 	syslog_connect();
 
 	syslog_check_upgrade();
@@ -1140,16 +1441,28 @@ function syslog_config_insert() {
 function syslog_graph_buttons($graph_elements = array()) {
 	global $config, $timespan, $graph_timeshifts;
 
-	include(dirname(__FILE__) . '/config.php');
+	if (!syslog_config_safe()) {
+		return;
+	}
 
-	if (get_nfilter_request_var('action') == 'view') return;
+	syslog_determine_config();
+	include(SYSLOG_CONFIG);
+	syslog_connect();
 
-	if (isset_request_var('graph_end') && strlen(get_filter_request_var('graph_end'))) {
-		$date1 = date('Y-m-d H:i:s', get_filter_request_var('graph_start'));
-		$date2 = date('Y-m-d H:i:s', get_filter_request_var('graph_end'));
+	if (get_nfilter_request_var('action') == 'view') {
+		return;
+	}
+
+	if (get_current_page() == 'graph_view.php') {
+		if (isset_request_var('graph_end') && strlen(get_filter_request_var('graph_end'))) {
+			$date1 = date('Y-m-d H:i:s', get_filter_request_var('graph_start'));
+			$date2 = date('Y-m-d H:i:s', get_filter_request_var('graph_end'));
+		} else {
+			$date1 = $timespan['current_value_date1'];
+			$date2 = $timespan['current_value_date2'];
+		}
 	} else {
-		$date1 = $timespan['current_value_date1'];
-		$date2 = $timespan['current_value_date2'];
+		return;
 	}
 
 	if (isset($graph_elements[1]['local_graph_id'])) {
@@ -1193,7 +1506,11 @@ function syslog_graph_buttons($graph_elements = array()) {
 }
 
 function syslog_utilities_action($action) {
-	global $config, $refresh, $syslog_cnn;
+	global $config, $refresh;
+
+	if (!syslog_config_safe()) {
+		return;
+	}
 
 	if ($action == 'purge_syslog_hosts') {
 		$records = 0;
@@ -1206,7 +1523,7 @@ function syslog_utilities_action($action) {
 				SELECT DISTINCT host_id
 				FROM syslog_removed
 			)');
-		$records += db_affected_rows($syslog_cnn);
+		$records += syslog_db_affected_rows();
 
 		syslog_db_execute('DELETE FROM syslog_host_facilities
 			WHERE host_id NOT IN (
@@ -1216,7 +1533,7 @@ function syslog_utilities_action($action) {
 				SELECT DISTINCT host_id
 				FROM syslog_removed
 			)');
-		$records += db_affected_rows($syslog_cnn);
+		$records += syslog_db_affected_rows();
 
 		syslog_db_execute('DELETE FROM syslog_statistics
 			WHERE host_id NOT IN (
@@ -1226,7 +1543,7 @@ function syslog_utilities_action($action) {
 				SELECT DISTINCT host_id
 				FROM syslog_removed
 			)');
-		$records += db_affected_rows($syslog_cnn);
+		$records += syslog_db_affected_rows();
 
 		raise_message('syslog_info', __('There were %s Device records removed from the Syslog database', $records, 'syslog'), MESSAGE_LEVEL_INFO);
 
@@ -1239,6 +1556,10 @@ function syslog_utilities_action($action) {
 
 function syslog_utilities_list() {
 	global $config;
+
+	if (!syslog_config_safe()) {
+		return;
+	}
 
 	html_header(array(__('Syslog Utilities', 'syslog')), 2); ?>
 

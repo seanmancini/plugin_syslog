@@ -1,7 +1,7 @@
 <?php
 /*
  +-------------------------------------------------------------------------+
- | Copyright (C) 2007-2020 The Cacti Group                                 |
+ | Copyright (C) 2004-2023 The Cacti Group                                 |
  |                                                                         |
  | This program is free software; you can redistribute it and/or           |
  | modify it under the terms of the GNU General Public License             |
@@ -25,8 +25,12 @@
 chdir('../../');
 include('./include/cli_check.php');
 include_once('./lib/poller.php');
-include('./plugins/syslog/config.php');
 include_once('./plugins/syslog/functions.php');
+include_once('./plugins/syslog/database.php');
+
+syslog_determine_config();
+include(SYSLOG_CONFIG);
+syslog_connect();
 
 /* Let it run for an hour if it has to, to clear up any big
  * bursts of incoming syslog events
@@ -34,9 +38,9 @@ include_once('./plugins/syslog/functions.php');
 ini_set('max_execution_time', 3600);
 ini_set('memory_limit', '-1');
 
-global $syslog_debug;
+global $debug;
 
-$syslog_debug = true;
+$debug = true;
 
 /* process calling arguments */
 $parms = $_SERVER['argv'];
@@ -54,7 +58,7 @@ if (cacti_sizeof($parms)) {
 		switch ($arg) {
 			case '--debug':
 			case '-d':
-				$syslog_debug = true;
+				$debug = true;
 
 				break;
 			case '--version':
@@ -76,8 +80,7 @@ if (cacti_sizeof($parms)) {
 }
 
 /* record the start time */
-list($micro,$seconds) = explode(' ', microtime());
-$start_time = $seconds + $micro;
+$start_time = microtime(true);
 
 /* Connect to the Syslog Database */
 global $syslog_cnn, $cnn_id, $database_default;
